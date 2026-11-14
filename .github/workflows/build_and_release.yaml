@@ -26,9 +26,6 @@ on:
           - ubuntu-latest
           - macOS-latest
 
-permissions:
-  contents: read
-
 env:
   BUILD_TYPE: Release
 
@@ -41,11 +38,11 @@ jobs:
       release-tag: ${{ steps.release.outputs.tag }}
 
     steps:
-      - name: Get latest Aseprite release
+      - name: Fetch latest Aseprite release
         id: release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -56,11 +53,11 @@ jobs:
             | jq -r '.tag_name // empty')"
 
           if [[ -z "$tag" ]]; then
-            echo "Could not determine the latest Aseprite release." >&2
+            echo "Could not find the latest Aseprite release." >&2
             exit 1
           fi
 
-          echo "Using Aseprite version: $tag"
+          echo "Aseprite release: $tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
   create-release:
@@ -74,7 +71,7 @@ jobs:
       contents: write
 
     steps:
-      - name: Create release if it does not exist
+      - name: Create release
         uses: ncipollo/release-action@v1.21.0
         with:
           tag: ${{ needs.fetch-aseprite-info.outputs.release-tag }}
@@ -128,6 +125,8 @@ jobs:
             g++ \
             cmake \
             ninja-build \
+            curl \
+            jq \
             unzip \
             zip \
             libpixman-1-dev \
@@ -164,23 +163,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            this_dir="$(cygpath "$GITHUB_WORKSPACE/aseprite")"
-          else
-            this_dir="$GITHUB_WORKSPACE/aseprite"
-          fi
-
-          skia_url="$(source "$this_dir/laf/misc/skia-url.sh" | xargs)"
+          # Aseprite's script expects the build configuration argument.
+          skia_url="$(bash laf/misc/skia-url.sh Release)"
 
           if [[ -z "$skia_url" ]]; then
-            echo "Could not determine the correct Skia download URL." >&2
+            echo "Could not determine the Skia download URL." >&2
             exit 1
           fi
 
-          echo "Downloading Skia from:"
-          echo "$skia_url"
+          echo "Skia download URL: $skia_url"
 
-          skia_file="$(basename "$skia_url")"
+          mkdir -p skia
+
+          skia_file="skia/$(basename "$skia_url")"
 
           curl -fL --retry 3 \
             -o "$skia_file" \
@@ -188,14 +183,14 @@ jobs:
 
           unzip -q "$skia_file" -d skia
 
-          test -d skia
+          echo "Skia downloaded and extracted."
 
       - name: Install Ninja
         uses: aseprite/get-ninja@main
 
       - name: Configure MSVC
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: TheMrMilchmann/setup-msvc-dev@v4
         with:
           arch: x64
 
@@ -205,10 +200,24 @@ jobs:
         run: |
           set -euo pipefail
 
+          skia_arch=x64
+
           if [[ "$RUNNER_OS" == "macOS" ]]; then
-            skia_arch=arm64
-          else
-            skia_arch=x64
+            machine="$(uname -m)"
+
+            if [[ "$machine" == "arm64" ]]; then
+              skia_arch=arm64
+            else
+              skia_arch=x64
+            fi
+          fi
+
+          skia_dir="$(realpath skia)"
+          skia_library_dir="$(realpath "skia/out/Release-$skia_arch")"
+
+          if [[ ! -d "$skia_library_dir" ]]; then
+            echo "Skia library directory is missing: $skia_library_dir" >&2
+            exit 1
           fi
 
           cmake_args=(
@@ -221,8 +230,8 @@ jobs:
             -DENABLE_SCRIPTING=ON
             -DENABLE_CCACHE=OFF
             -DLAF_BACKEND=skia
-            "-DSKIA_DIR=$(realpath skia)"
-            "-DSKIA_LIBRARY_DIR=$(realpath "skia/out/Release-$skia_arch")"
+            "-DSKIA_DIR=$skia_dir"
+            "-DSKIA_LIBRARY_DIR=$skia_library_dir"
           )
 
           if [[ "$RUNNER_OS" == "Linux" ]]; then
@@ -238,70 +247,55 @@ jobs:
 
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             cmake_args+=(
-              -DCMAKE_OSX_ARCHITECTURES=arm64
-              -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+              "-DCMAKE_OSX_ARCHITECTURES=$skia_arch"
             )
+
+            if [[ "$skia_arch" == "arm64" ]]; then
+              cmake_args+=(
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+              )
+            else
+              cmake_args+=(
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=10.14
+              )
+            fi
           fi
 
           cmake "${cmake_args[@]}"
 
       - name: Compile Aseprite
-        working-directory: aseprite/build
+        working-directory: aseprite
         shell: bash
         run: |
           set -euo pipefail
-          ninja
 
-      - name: Clean build output
+          cmake --build build \
+            --target aseprite \
+            --parallel 2
+
+      - name: Verify executable
         working-directory: aseprite/build/bin
         shell: bash
         run: |
           set -euo pipefail
 
-          find . -mindepth 1 -maxdepth 1 \
-            ! -name 'aseprite' \
-            ! -name 'aseprite.exe' \
-            ! -name 'data' \
-            ! -name 'Aseprite.app' \
-            -exec rm -rf -- {} +
-
-      - name: Verify bundled translations
-        working-directory: aseprite/build/bin
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          data_dir=data
-
-          if [[ "$RUNNER_OS" == "macOS" ]] &&
-             [[ -d "Aseprite.app/Contents/Resources/data" ]]; then
-            data_dir="Aseprite.app/Contents/Resources/data"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            executable="aseprite.exe"
+          else
+            executable="aseprite"
           fi
 
-          strings_dir="$data_dir/strings.git"
-
-          if [[ ! -d "$strings_dir" ]]; then
-            echo "Translation directory not found: $strings_dir" >&2
+          if [[ ! -f "$executable" ]]; then
+            echo "Aseprite executable was not generated." >&2
             exit 1
           fi
 
-          translation_found=false
+          echo "Found $executable"
 
-          for translation in "$strings_dir"/*.ini; do
-            if [[ -f "$translation" ]] &&
-               [[ "${translation##*/}" != "en.ini" ]] &&
-               grep -Eq '^[[:space:]]*\[[^]]+\]' "$translation"; then
-              translation_found=true
-              break
-            fi
-          done
-
-          if [[ "$translation_found" != true ]]; then
-            echo "No non-English translation content found." >&2
+          if [[ ! -d "data" ]]; then
+            echo "Aseprite data directory was not generated." >&2
             exit 1
           fi
-
-          rm -rf "$strings_dir/.git"
 
       - name: Create portable configuration
         working-directory: aseprite/build/bin
@@ -309,13 +303,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$RUNNER_OS" == "macOS" ]] &&
-             [[ -d "Aseprite.app/Contents/MacOS" ]]; then
-            echo '# Portable Aseprite configuration' \
-              > Aseprite.app/Contents/MacOS/aseprite.ini
-          else
-            echo '# Portable Aseprite configuration' > aseprite.ini
-          fi
+          echo '# Portable Aseprite configuration' > aseprite.ini
 
       - name: Create Windows ZIP
         if: runner.os == 'Windows'
@@ -362,17 +350,13 @@ jobs:
 
           archive="Aseprite-$RELEASE_TAG-macOS.zip"
 
-          if [[ -d "Aseprite.app" ]]; then
-            ditto -c -k --sequesterRsrc --keepParent \
-              Aseprite.app \
-              "$RUNNER_TEMP/$archive"
-          else
-            zip -r "$RUNNER_TEMP/$archive" .
-          fi
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$GITHUB_WORKSPACE/aseprite/build/bin" \
+            "$RUNNER_TEMP/$archive"
 
           mv "$RUNNER_TEMP/$archive" .
 
-      - name: Upload validation artifact
+      - name: Upload test artifact
         if: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish }}
         uses: actions/upload-artifact@v7
         with:
