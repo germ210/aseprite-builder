@@ -26,23 +26,23 @@ on:
           - ubuntu-latest
           - macOS-latest
 
-env:
-  BUILD_TYPE: Release
+permissions:
+  contents: write
 
 jobs:
   fetch-aseprite-info:
-    name: Fetch Aseprite version
+    name: Get latest Aseprite version
     runs-on: ubuntu-latest
 
     outputs:
       release-tag: ${{ steps.release.outputs.tag }}
 
     steps:
-      - name: Fetch latest Aseprite release
+      - name: Get latest release tag
         id: release
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -53,11 +53,11 @@ jobs:
             | jq -r '.tag_name // empty')"
 
           if [[ -z "$tag" ]]; then
-            echo "Could not find the latest Aseprite release." >&2
+            echo "Could not find the latest Aseprite release."
             exit 1
           fi
 
-          echo "Aseprite release: $tag"
+          echo "Latest Aseprite version: $tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
   create-release:
@@ -67,23 +67,20 @@ jobs:
 
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
 
-    permissions:
-      contents: write
-
     steps:
       - name: Create release
         uses: ncipollo/release-action@v1.21.0
         with:
           tag: ${{ needs.fetch-aseprite-info.outputs.release-tag }}
           name: Aseprite ${{ needs.fetch-aseprite-info.outputs.release-tag }}
-          body: Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}
+          body: Aseprite ${{ needs.fetch-aseprite-info.outputs.release-tag }}
           skipIfReleaseExists: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
   build-aseprite:
     name: Build Aseprite (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     needs:
       - fetch-aseprite-info
@@ -103,9 +100,6 @@ jobs:
         )
       }}
 
-    permissions:
-      contents: write
-
     strategy:
       fail-fast: false
       matrix:
@@ -118,29 +112,33 @@ jobs:
         run: |
           set -euo pipefail
 
-          sudo apt-get update -qq
+          sudo apt-get update
 
           sudo apt-get install -y \
-            clang \
             g++ \
+            clang \
             cmake \
             ninja-build \
-            curl \
-            jq \
             unzip \
+            curl \
+            git \
             zip \
-            libpixman-1-dev \
-            libfreetype6-dev \
-            libharfbuzz-dev \
-            zlib1g-dev \
             libx11-dev \
             libxcursor-dev \
             libxi-dev \
             libxrandr-dev \
             libgl1-mesa-dev \
             libfontconfig1-dev \
-            libssl-dev \
-            libzstd-dev
+            libwebp-dev
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          brew update
+          brew install cmake ninja
 
       - name: Checkout Aseprite source
         shell: bash
@@ -152,180 +150,124 @@ jobs:
           git clone \
             --depth 1 \
             --recurse-submodules \
-            --shallow-submodules \
             --branch "$RELEASE_TAG" \
             https://github.com/aseprite/aseprite.git \
             aseprite
 
-      - name: Install Skia
-        working-directory: aseprite
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Aseprite's script expects the build configuration argument.
-          skia_url="$(bash laf/misc/skia-url.sh Release)"
-
-          if [[ -z "$skia_url" ]]; then
-            echo "Could not determine the Skia download URL." >&2
-            exit 1
-          fi
-
-          echo "Skia download URL: $skia_url"
-
-          mkdir -p skia
-
-          skia_file="skia/$(basename "$skia_url")"
-
-          curl -fL --retry 3 \
-            -o "$skia_file" \
-            "$skia_url"
-
-          unzip -q "$skia_file" -d skia
-
-          echo "Skia downloaded and extracted."
-
-      - name: Install Ninja
-        uses: aseprite/get-ninja@main
-
-      - name: Configure MSVC
+      - name: Configure Visual Studio
         if: runner.os == 'Windows'
-        uses: TheMrMilchmann/setup-msvc-dev@v4
+        uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
           arch: x64
 
-      - name: Configure and generate build files
-        working-directory: aseprite
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          skia_arch=x64
-
-          if [[ "$RUNNER_OS" == "macOS" ]]; then
-            machine="$(uname -m)"
-
-            if [[ "$machine" == "arm64" ]]; then
-              skia_arch=arm64
-            else
-              skia_arch=x64
-            fi
-          fi
-
-          skia_dir="$(realpath skia)"
-          skia_library_dir="$(realpath "skia/out/Release-$skia_arch")"
-
-          if [[ ! -d "$skia_library_dir" ]]; then
-            echo "Skia library directory is missing: $skia_library_dir" >&2
-            exit 1
-          fi
-
-          cmake_args=(
-            -S .
-            -B build
-            -G Ninja
-            "-DCMAKE_BUILD_TYPE=$BUILD_TYPE"
-            -DENABLE_TESTS=OFF
-            -DENABLE_I18N_STRINGS=ON
-            -DENABLE_SCRIPTING=ON
-            -DENABLE_CCACHE=OFF
-            -DLAF_BACKEND=skia
-            "-DSKIA_DIR=$skia_dir"
-            "-DSKIA_LIBRARY_DIR=$skia_library_dir"
-          )
-
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            export CC=clang
-            export CXX=clang++
-
-            cmake_args+=(
-              "-DCMAKE_CXX_FLAGS:STRING=-stdlib=libstdc++"
-              "-DCMAKE_EXE_LINKER_FLAGS:STRING=-stdlib=libstdc++"
-              -DOPENSSL_USE_STATIC_LIBS=OFF
-            )
-          fi
-
-          if [[ "$RUNNER_OS" == "macOS" ]]; then
-            cmake_args+=(
-              "-DCMAKE_OSX_ARCHITECTURES=$skia_arch"
-            )
-
-            if [[ "$skia_arch" == "arm64" ]]; then
-              cmake_args+=(
-                -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
-              )
-            else
-              cmake_args+=(
-                -DCMAKE_OSX_DEPLOYMENT_TARGET=10.14
-              )
-            fi
-          fi
-
-          cmake "${cmake_args[@]}"
-
-      - name: Compile Aseprite
-        working-directory: aseprite
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cmake --build build \
-            --target aseprite \
-            --parallel 2
-
-      - name: Verify executable
-        working-directory: aseprite/build/bin
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            executable="aseprite.exe"
-          else
-            executable="aseprite"
-          fi
-
-          if [[ ! -f "$executable" ]]; then
-            echo "Aseprite executable was not generated." >&2
-            exit 1
-          fi
-
-          echo "Found $executable"
-
-          if [[ ! -d "data" ]]; then
-            echo "Aseprite data directory was not generated." >&2
-            exit 1
-          fi
-
-      - name: Create portable configuration
-        working-directory: aseprite/build/bin
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo '# Portable Aseprite configuration' > aseprite.ini
-
-      - name: Create Windows ZIP
+      - name: Install Ninja on Windows
         if: runner.os == 'Windows'
-        working-directory: aseprite/build/bin
+        uses: aseprite/get-ninja@main
+
+      - name: Automatically build Aseprite on Windows
+        if: runner.os == 'Windows'
+        working-directory: aseprite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "Starting Aseprite automatic build..."
+
+          # build.cmd invokes the official build.ps1 and build.sh scripts.
+          # NUL prevents the final pause from waiting for keyboard input.
+          cmd.exe /d /c "build.cmd --auto --norun < NUL"
+
+          $executable = Join-Path $PWD "build\bin\aseprite.exe"
+
+          if (!(Test-Path $executable)) {
+            throw "Aseprite build failed. The executable was not generated."
+          }
+
+          Write-Host "Aseprite was built successfully."
+
+      - name: Automatically build Aseprite on Linux
+        if: runner.os == 'Linux'
+        working-directory: aseprite
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x build.sh
+
+          echo "Starting Aseprite automatic build..."
+
+          ./build.sh --auto --norun
+
+          test -f build/bin/aseprite
+
+          echo "Aseprite was built successfully."
+
+      - name: Automatically build Aseprite on macOS
+        if: runner.os == 'macOS'
+        working-directory: aseprite
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x build.sh
+
+          echo "Starting Aseprite automatic build..."
+
+          ./build.sh --auto --norun
+
+          test -f build/bin/aseprite
+
+          echo "Aseprite was built successfully."
+
+      - name: Verify Windows build files
+        if: runner.os == 'Windows'
+        working-directory: aseprite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $bin = Join-Path $PWD "build\bin"
+
+          if (!(Test-Path "$bin\aseprite.exe")) {
+            throw "aseprite.exe is missing."
+          }
+
+          if (!(Test-Path "$bin\data")) {
+            throw "Aseprite data directory is missing."
+          }
+
+          Write-Host "Checking OpenSSL dependencies..."
+
+          $dependencies = & dumpbin /dependents "$bin\aseprite.exe" 2>&1
+
+          $dependencies | Out-Host
+
+          Write-Host "Windows build files verified."
+
+      - name: Package Windows build
+        if: runner.os == 'Windows'
+        working-directory: aseprite
         shell: pwsh
         env:
           RELEASE_TAG: ${{ needs.fetch-aseprite-info.outputs.release-tag }}
         run: |
           $ErrorActionPreference = 'Stop'
 
+          $bin = Join-Path $PWD "build\bin"
           $archive = "Aseprite-$env:RELEASE_TAG-Windows.zip"
-          $tempArchive = Join-Path $env:RUNNER_TEMP $archive
+          $destination = Join-Path $env:RUNNER_TEMP $archive
 
           Compress-Archive `
-            -Path * `
-            -DestinationPath $tempArchive `
+            -Path "$bin\*" `
+            -DestinationPath $destination `
             -CompressionLevel Optimal `
             -Force
 
-          Move-Item $tempArchive $archive -Force
+          Move-Item $destination $bin -Force
 
-      - name: Create Linux ZIP
+          Write-Host "Created $archive"
+
+      - name: Package Linux build
         if: runner.os == 'Linux'
         working-directory: aseprite/build/bin
         shell: bash
@@ -339,7 +281,9 @@ jobs:
           zip -r "$RUNNER_TEMP/$archive" .
           mv "$RUNNER_TEMP/$archive" .
 
-      - name: Create macOS ZIP
+          echo "Created $archive"
+
+      - name: Package macOS build
         if: runner.os == 'macOS'
         working-directory: aseprite/build/bin
         shell: bash
@@ -350,23 +294,22 @@ jobs:
 
           archive="Aseprite-$RELEASE_TAG-macOS.zip"
 
-          ditto -c -k --sequesterRsrc --keepParent \
-            "$GITHUB_WORKSPACE/aseprite/build/bin" \
-            "$RUNNER_TEMP/$archive"
-
+          zip -r "$RUNNER_TEMP/$archive" .
           mv "$RUNNER_TEMP/$archive" .
+
+          echo "Created $archive"
 
       - name: Upload test artifact
         if: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
-          name: Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}-${{ runner.os }}-${{ runner.arch }}-attempt${{ github.run_attempt }}
+          name: Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}-${{ runner.os }}
           path: aseprite/build/bin/Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}-${{ runner.os }}.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
 
-      - name: Upload release asset
+      - name: Upload GitHub Release asset
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
         uses: svenstaro/upload-release-action@v2
         with:
